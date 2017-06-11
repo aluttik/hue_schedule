@@ -1,1 +1,21 @@
-/Users/Arie/.hue_schedule/schedule.json
+{
+    "location": {
+        "city": "San Francisco"
+    },
+    "jobs": [
+        {
+            "lights": [4, 7],
+            "on": true,
+            "color": "#ffe6a8",
+            "when": "sunset",
+            "transition": 0.1
+        },
+        {
+            "lights": [4, 7],
+            "on": true,
+            "color": "#ffe6a8",
+            "when": "sunrise",
+            "transition": 0.1
+        }
+    ]
+}
