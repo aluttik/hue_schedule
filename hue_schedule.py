@@ -9,10 +9,12 @@ Schedule when to change your change your hue lights
 
 
 """
+import atexit
 import collections
 import datetime
 import json
 import logging
+import logging.handlers
 import os
 import platform
 import time
@@ -31,11 +33,13 @@ logger.setLevel(logging.INFO)
 
 
 def get_config_dir():
-    homedir = os.getenv(phue.USER_HOME)
-    if homedir is not None and os.access(homedir, os.W_OK):
+    homedir = os.getenv(phue.USER_HOME) or os.path.expanduser('~')
+    if homedir and homedir.strip(os.path.sep) and os.access(homedir, os.W_OK):
         return os.path.join(homedir, '.hue_schedule')
     elif 'iPad' in platform.machine() or 'iPhone' in platform.machine():
         return os.path.join(homedir, 'Documents', '.hue_schedule')
+    elif os.path.exists('/etc/hue_schedule'):
+        return '/etc/hue_schedule'
     else:
         return os.getcwd()
 
@@ -62,7 +66,12 @@ def parse_time(config, when):
     return get_time()
 
 
-HueJob = collections.namedtuple('HueJob', 'when lights command')
+class HueJob(collections.namedtuple('HueJob', 'when lights command')):
+    @property
+    def until(self):
+        now = datetime.datetime.now(tz=self.when.tzinfo)
+        return (self.when - now).total_seconds()
+
 
 class HueScheduler(object):
     named_times = ('dawn', 'sunrise', 'noon', 'sunset', 'dusk')
@@ -78,6 +87,7 @@ class HueScheduler(object):
         self.bridge_config_path = os.path.join(config_dir, 'bridge.json')
         self.schedule_config_path = os.path.join(config_dir, 'schedule.json')
 
+        logger.info('using bridge config at %s', self.bridge_config_path)
         self.bridge = phue.Bridge(config_file_path=self.bridge_config_path)
         self.schedule_jobs()
 
@@ -85,6 +95,11 @@ class HueScheduler(object):
         job = self.queue.popleft()
         logger.info('running %s for lights %s', job.command, job.lights)
         self.bridge.set_light(job.lights, job.command)
+
+        if self.queue:
+            logger.info('%s jobs scheduled; next job at %s', len(self.queue), self.next_job.when.strftime('%I:%M:%S %p %Z').strip())
+        else:
+            logger.info('no jobs scheduled')
 
     @property
     def next_job(self):
@@ -102,7 +117,7 @@ class HueScheduler(object):
 
         self.last_mtime = os.path.getmtime(self.schedule_config_path)
         with open(self.schedule_config_path) as fp:
-            logger.info('reading config at %s', self.schedule_config_path)
+            logger.info('reading schedule config at %s', self.schedule_config_path)
             config = json.load(fp)
 
         payload = self.bridge.get_api()
@@ -141,31 +156,39 @@ class HueScheduler(object):
         for job in sorted(jobs):
             self.queue.append(job)
 
+        if self.queue:
+            logger.info('%s jobs scheduled; next job at %s', len(self.queue), self.next_job.when.strftime('%I:%M:%S %p %Z').strip())
+        else:
+            logger.info('no jobs scheduled')
 
 def main():
+    log_exit = lambda: logger.info('exiting script')
+    atexit.register(log_exit)
+    logger.info('beginning script')
+
     wait_time = 60
     scheduler = HueScheduler()
+
     while True:
-        if not scheduler.queue or scheduler.config_modified:
-            scheduler.schedule_jobs()
+        while scheduler.next_job.until > 0:
+            if not scheduler.queue or scheduler.config_modified:
+                if scheduler.queue:
+                    logger.info('config modified')
 
-        # if no jobs then check every 10 seconds to see if config was modified
-        if not scheduler.queue:
+                scheduler.schedule_jobs()
+
+                if scheduler.queue:
+                    continue
+
             time.sleep(wait_time)
-            logging.info('no jobs queued; sleeping for %s seconds', wait_time)
-            continue
 
-        then = scheduler.next_job.when
-        now = datetime.datetime.now(tz=then.tzinfo)
-        until = (then - now).total_seconds()
-
-        if until > 0:
-            logger.info('%ss until next job at %s; sleeping %ss', until, then, until / 2.0)
-            time.sleep(until / 2.0)
-        else:
-            scheduler.do_next_job()
+        scheduler.do_next_job()
 
 
 if __name__ == '__main__':
-    main()
-
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except:
+        logger.exception('exception raised')
