@@ -18,6 +18,7 @@ import logging.handlers
 import os
 import platform
 import time
+import socket
 
 import astral
 import dateparser
@@ -47,23 +48,31 @@ _a = astral.Astral()
 _a.solar_depression = 'civil'
 
 
-def parse_time(config, when):
+def parse_time(config, when, tomorrow=False):
     city = config.get('city', '')
     region = config.get('region', '')
     latitude = config.get('latitude', 0.0)
     longitude = config.get('longitude', 0.0)
     timezone = config.get('timezone', '')
     elevation = config.get('elevation', 0)
+
     if city:
         latitude = latitude or _a[city].latitude
         longitude = longitude or _a[city].longitude
         region = region or _a[city].region
         timezone = timezone or _a[city].timezone
         elevation = elevation or _a[city].elevation
+
     info = (city, region, latitude, longitude, timezone, elevation)
     location = astral.Location(info)
-    get_time = getattr(location, when)
-    return get_time()
+
+    date = datetime.datetime.now(tz=location.tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    result = getattr(location, when)(date=date)
+
+    if result < datetime.datetime.now(tz=location.tz):
+        result = getattr(location, when)(date=date+datetime.timedelta(days=1))
+
+    return result
 
 
 class HueJob(collections.namedtuple('HueJob', 'when lights command')):
@@ -72,6 +81,9 @@ class HueJob(collections.namedtuple('HueJob', 'when lights command')):
         now = datetime.datetime.now(tz=self.when.tzinfo)
         return (self.when - now).total_seconds()
 
+    def __str__(self):
+        return '%s(when=%r, lights=%r, command=%s)' % (self.__class__.__name__, self.when.isoformat(), self.lights, json.dumps(self.command))
+
 
 class HueScheduler(object):
     named_times = ('dawn', 'sunrise', 'noon', 'sunset', 'dusk')
@@ -79,6 +91,7 @@ class HueScheduler(object):
     def __init__(self):
         config_dir = get_config_dir()
         if not os.path.exists(config_dir):
+            print 'NOT EXISTS: %r' % config_dir
             os.mkdir(config_dir)
 
         self.queue = collections.deque()
@@ -94,12 +107,18 @@ class HueScheduler(object):
     def do_next_job(self):
         job = self.queue.popleft()
         logger.info('running %s for lights %s', job.command, job.lights)
-        self.bridge.set_light(job.lights, job.command)
+        try:
+            self.bridge.set_light(job.lights, job.command)
+        except socket.error:
+            logger.error('socket error; could not perform job')
+            self.queue.appendleft(job)
+            time.sleep(10)
+            return
 
         if self.queue:
-            logger.info('%s jobs scheduled; next job at %s', len(self.queue), self.next_job.when.strftime('%I:%M:%S %p %Z').strip())
+            logger.info('success! next job is %s', self.next_job)
         else:
-            logger.info('no jobs scheduled')
+            self.schedule_jobs()
 
     @property
     def next_job(self):
@@ -127,11 +146,13 @@ class HueScheduler(object):
             lights = job['lights']
 
             if job['when'] in self.named_times and 'location' in config:
-                when = parse_time(config=config['location'], when=job['when'])
+                when = parse_time(config=config['location'], when=job['when'], tomorrow=False)
             else:
                 timezone = payload['config']['timezone']
                 settings = {'TIMEZONE': timezone, 'RETURN_AS_TIMEZONE_AWARE': True}
-                when = dateparser.parse(job['when'], settings=settings)
+                when = dateparser.parse(job['when'] + ' today', settings=settings)
+                if when < now.replace(tzinfo=when.tzinfo):
+                    when += datetime.timedelta(days=1)
 
             if when < now.replace(tzinfo=when.tzinfo):
                 continue
@@ -155,34 +176,28 @@ class HueScheduler(object):
 
         for job in sorted(jobs):
             self.queue.append(job)
+            logger.info('scheduled job: %s', job)
 
-        if self.queue:
-            logger.info('%s jobs scheduled; next job at %s', len(self.queue), self.next_job.when.strftime('%I:%M:%S %p %Z').strip())
-        else:
-            logger.info('no jobs scheduled')
+        if not self.queue:
+            logger.info('no jobs to schedule')
+
 
 def main():
     log_exit = lambda: logger.info('exiting script')
     atexit.register(log_exit)
     logger.info('beginning script')
 
-    wait_time = 60
+    wait_time = 1
     scheduler = HueScheduler()
 
     while True:
-        while scheduler.next_job.until > 0:
-            if not scheduler.queue or scheduler.config_modified:
-                if scheduler.queue:
-                    logger.info('config modified')
-
-                scheduler.schedule_jobs()
-
-                if scheduler.queue:
-                    continue
-
+        if scheduler.config_modified:
+            logger.info('config modified')
+            scheduler.schedule_jobs()
+        elif scheduler.next_job and scheduler.next_job.until <= 0:
+            scheduler.do_next_job()
+        else:
             time.sleep(wait_time)
-
-        scheduler.do_next_job()
 
 
 if __name__ == '__main__':
